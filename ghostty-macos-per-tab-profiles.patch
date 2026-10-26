@@ -1,0 +1,148 @@
+diff --git a/macos/Sources/App/AppDelegate.swift b/macos/Sources/App/AppDelegate.swift
+index d559e547a..6b78b0341 100644
+--- a/macos/Sources/App/AppDelegate.swift
++++ b/macos/Sources/App/AppDelegate.swift
+@@ -327,6 +327,7 @@ class AppDelegate: NSObject,
+         }
+ 
+         // Setup our menu
++        setupProfilesMenu()
+         setupMenuImages()
+ 
+         // Setup signal handlers
+diff --git a/macos/Sources/App/AppDelegate+Profiles.swift b/macos/Sources/App/AppDelegate+Profiles.swift
+new file mode 100644
+index 000000000..4723dc679
+--- /dev/null
++++ b/macos/Sources/App/AppDelegate+Profiles.swift
+@@ -0,0 +1,93 @@
++import AppKit
++import GhosttyKit
++
++extension AppDelegate: NSMenuDelegate {
++    /// Profiles are deliberately local to the selected tab; the app config is never replaced.
++    func setupProfilesMenu() {
++        guard let windowMenu = NSApp.windowsMenu else { return }
++        let menu = NSMenu(title: "Profiles")
++        menu.autoenablesItems = false
++        menu.delegate = self
++        let item = NSMenuItem(title: menu.title, action: nil, keyEquivalent: "")
++        item.submenu = menu
++        let index = windowMenu.items.firstIndex {
++            $0.action == #selector(BaseTerminalController.splitZoom(_:))
++        } ?? windowMenu.numberOfItems
++        windowMenu.insertItem(item, at: index)
++        windowMenu.insertItem(.separator(), at: index + 1)
++    }
++
++    func menuNeedsUpdate(_ menu: NSMenu) {
++        menu.removeAllItems()
++        let directory = FileManager.default.homeDirectoryForCurrentUser
++            .appendingPathComponent(".config/ghostty/profiles", isDirectory: true)
++        let profiles: [URL]
++        do {
++            profiles = try Self.profileURLs(in: directory)
++        } catch {
++            // A missing directory is normal until the user creates their first profile.
++            if (error as NSError).code != NSFileReadNoSuchFileError {
++                Self.logger.warning("Unable to list profiles: \(error.localizedDescription, privacy: .public)")
++            }
++            profiles = []
++        }
++
++        guard !profiles.isEmpty else {
++            menu.addItem(withTitle: "No Profiles", action: nil, keyEquivalent: "").isEnabled = false
++            return
++        }
++
++        let controller = NSApp.keyWindow?.windowController as? TerminalController
++        for url in profiles {
++            let item = menu.addItem(
++                withTitle: url.deletingPathExtension().lastPathComponent,
++                action: #selector(applyProfile(_:)),
++                keyEquivalent: "")
++            item.target = self
++            item.representedObject = url
++            item.isEnabled = controller?.surfaceTree.isEmpty == false
++        }
++    }
++
++    /// Read on each menu opening so adding or removing files needs no restart.
++    static func profileURLs(in directory: URL) throws -> [URL] {
++        try FileManager.default.contentsOfDirectory(
++            at: directory,
++            includingPropertiesForKeys: [.isRegularFileKey],
++            options: [.skipsHiddenFiles]
++        ).filter {
++            $0.pathExtension == "ghostty" && (try? $0.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
++        }.sorted {
++            $0.deletingPathExtension().lastPathComponent < $1.deletingPathExtension().lastPathComponent
++        }
++    }
++
++    @objc private func applyProfile(_ sender: NSMenuItem) {
++        guard let url = sender.representedObject as? URL,
++              let controller = NSApp.keyWindow?.windowController as? TerminalController else { return }
++
++        // Snapshot the entire tree, including splits hidden by zoom. Refuse to update a
++        // partially initialized tab rather than silently applying to only some splits.
++        let views = Array(controller.surfaceTree)
++        let surfaces = views.compactMap { $0.surface }
++        guard !surfaces.isEmpty, surfaces.count == views.count else { return }
++        guard FileManager.default.isReadableFile(atPath: url.path),
++              (try? url.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
++            Self.logger.warning("Unable to read selected profile")
++            return
++        }
++
++        // Use the normal loader (including relative config-file includes). Diagnostics
++        // are logged there; reject all errors before changing any surface in this tab.
++        let config = Ghostty.Config(at: url.path)
++        guard let rawConfig = config.config, config.errors.isEmpty else {
++            Self.logger.warning("Selected profile failed to load; tab configuration unchanged")
++            return
++        }
++        withExtendedLifetime(config) {
++            for surface in surfaces {
++                ghostty_surface_update_config(surface, rawConfig)
++            }
++        }
++    }
++}
+diff --git a/macos/Tests/ProfileDiscoveryTests.swift b/macos/Tests/ProfileDiscoveryTests.swift
+new file mode 100644
+index 000000000..2a228ebce
+--- /dev/null
++++ b/macos/Tests/ProfileDiscoveryTests.swift
+@@ -0,0 +1,31 @@
++import Foundation
++import Testing
++@testable import Ghostty
++
++@MainActor
++struct ProfileDiscoveryTests {
++    @Test func discoversSortedProfilesAndRefreshes() throws {
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: directory) }
++
++        #expect(try AppDelegate.profileURLs(in: directory).isEmpty)
++        for name in ["red.ghostty", "blue.ghostty", "notes.txt", ".hidden.ghostty"] {
++            try "".write(to: directory.appendingPathComponent(name), atomically: true, encoding: .utf8)
++        }
++        try FileManager.default.createDirectory(
++            at: directory.appendingPathComponent("directory.ghostty"), withIntermediateDirectories: true)
++        #expect(try AppDelegate.profileURLs(in: directory).map(\.lastPathComponent) == ["blue.ghostty", "red.ghostty"])
++
++        try FileManager.default.removeItem(at: directory.appendingPathComponent("red.ghostty"))
++        try "".write(to: directory.appendingPathComponent("green.ghostty"), atomically: true, encoding: .utf8)
++        #expect(try AppDelegate.profileURLs(in: directory).map(\.lastPathComponent) == ["blue.ghostty", "green.ghostty"])
++    }
++
++    @Test func missingDirectory() {
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
++        #expect(throws: (any Error).self) {
++            try AppDelegate.profileURLs(in: directory)
++        }
++    }
++}
